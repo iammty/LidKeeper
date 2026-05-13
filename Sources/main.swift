@@ -153,8 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupMenuBar() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = drawIcon()
+        statusItem = NSStatusBar.system.statusItem(withLength: 32)
 
         let menu = NSMenu()
         statusMenuItem = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
@@ -169,38 +168,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshMenuBar() {
-        statusItem.button?.image = drawIcon()
+        let color = isEnabled ? NSColor.systemGreen : NSColor.secondaryLabelColor
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.menuBarFont(ofSize: 0),
+            .foregroundColor: color
+        ]
+        statusItem.button?.attributedTitle = NSAttributedString(string: "LK", attributes: attrs)
         statusMenuItem.title = isEnabled ? "✅ Virtual Display Active" : "⛔ Disabled"
         toggleMenuItem.title = isEnabled ? "Turn Off" : "Turn On"
-    }
-
-    private func drawIcon() -> NSImage {
-        let img = NSImage(size: NSSize(width: 20, height: 20))
-        img.lockFocus()
-        let fill = isEnabled ? NSColor.systemGreen : NSColor.labelColor
-        let rect = NSRect(x: 2, y: 3, width: 16, height: 13)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
-        fill.setFill()
-        path.fill()
-        if !isEnabled {
-            NSColor.separatorColor.setStroke()
-            path.lineWidth = 1
-            path.stroke()
-        }
-        let lid = NSBezierPath()
-        lid.move(to: NSPoint(x: 3, y: 9))
-        lid.line(to: NSPoint(x: 17, y: 9))
-        lid.lineWidth = 2
-        (isEnabled ? NSColor.white : NSColor.labelColor).setStroke()
-        lid.stroke()
-        let label = (isEnabled ? "Ld" : "L") as NSString
-        label.draw(at: NSPoint(x: 7, y: 5), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 7, weight: .bold),
-            .foregroundColor: isEnabled ? NSColor.white : NSColor.labelColor
-        ])
-        img.unlockFocus()
-        img.isTemplate = false
-        return img
     }
 
     @objc private func toggleEnabled() {
