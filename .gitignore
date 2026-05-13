@@ -1,0 +1,5 @@
+# Build outputs
+*.o
+*.d
+# We don't track the .app bundle
+.DS_Store
