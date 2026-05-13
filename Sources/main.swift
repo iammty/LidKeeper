@@ -1,122 +1,210 @@
 import Cocoa
-import IOKit
+import CoreGraphics
 
-// MARK: - C bridge declarations
-// These are implemented in pm_helper.c using IOKit PM C API
-// (IOKit.pm symbols not exposed in Swift module)
+// MARK: - Virtual Display Manager via ObjC Runtime
+// CGVirtualDisplay, CGVirtualDisplayDescriptor, CGVirtualDisplaySettings
+// are private CoreGraphics classes. Access them via ObjC runtime instead of
+// requiring a C/Dylib bridge.
+//
+// This tricks macOS into thinking an external monitor is connected, which
+// triggers native clamshell mode: lid closes -> built-in display turns off,
+// system stays awake for the "external" display.
 
-@_silgen_name("pm_prevent_system_sleep")
-func pm_preventSystemSleep(_ reason: UnsafePointer<CChar>) -> UInt32
+private func objcClass(_ name: String) -> NSObject.Type? {
+    NSClassFromString(name) as? NSObject.Type
+}
 
-@_silgen_name("pm_no_idle_sleep")
-func pm_noIdleSleep(_ reason: UnsafePointer<CChar>) -> UInt32
+private func objcCall(_ obj: NSObject, _ sel: String, _ arg: AnyObject) {
+    obj.perform(NSSelectorFromString(sel), with: arg)
+}
 
-@_silgen_name("pm_release_assertion")
-func pm_releaseAssertion(_ assertionID: UInt32) -> Bool
+private func objcUInt32(_ obj: NSObject, _ sel: String, _ val: UInt32) {
+    typealias Fn = @convention(c) (AnyObject, Selector, UInt32) -> Void
+    let m = class_getInstanceMethod(type(of: obj), NSSelectorFromString(sel))!
+    unsafeBitCast(method_getImplementation(m), to: Fn.self)(obj, NSSelectorFromString(sel), val)
+}
+
+private func objcSize(_ obj: NSObject, _ sel: String, _ val: CGSize) {
+    typealias Fn = @convention(c) (AnyObject, Selector, CGSize) -> Void
+    let m = class_getInstanceMethod(type(of: obj), NSSelectorFromString(sel))!
+    unsafeBitCast(method_getImplementation(m), to: Fn.self)(obj, NSSelectorFromString(sel), val)
+}
+
+class VirtualDisplayManager {
+    private var display: NSObject?
+    private let queue = DispatchQueue(label: "com.lidkeeper.vd", qos: .userInteractive)
+
+    var isActive: Bool { display != nil }
+
+    var displayID: CGDirectDisplayID? {
+        guard let d = display else { return nil }
+        let sel = NSSelectorFromString("displayID")
+        guard d.responds(to: sel) else { return nil }
+        typealias GetID = @convention(c) (AnyObject, Selector) -> UInt32
+        let m = class_getInstanceMethod(type(of: d), sel)!
+        return unsafeBitCast(method_getImplementation(m), to: GetID.self)(d, sel)
+    }
+
+    func create() -> Bool {
+        guard display == nil else { return true }
+
+        guard let descClass = objcClass("CGVirtualDisplayDescriptor"),
+              let displayClass = objcClass("CGVirtualDisplay"),
+              let settingsClass = objcClass("CGVirtualDisplaySettings"),
+              let modeClass = objcClass("CGVirtualDisplayMode")
+        else {
+            NSLog("[LidKeeper] CGVirtualDisplay API not available")
+            return false
+        }
+
+        // Build descriptor
+        let desc = descClass.perform(NSSelectorFromString("new"))?
+            .takeUnretainedValue() as! NSObject
+        objcCall(desc, "setName:", "LidKeeper" as NSString)
+        objcUInt32(desc, "setMaxPixelsWide:", 1920)
+        objcUInt32(desc, "setMaxPixelsHigh:", 1080)
+        objcSize(desc, "setSizeInMillimeters:", CGSize(width: 530, height: 300))
+        objcUInt32(desc, "setVendorID:", 0x1337)
+        objcUInt32(desc, "setProductID:", 0x0001)
+        objcUInt32(desc, "setSerialNum:", 0x0001)
+        objcCall(desc, "setDispatchQueue:", queue)
+
+        // Create virtual display
+        let initSel = NSSelectorFromString("initWithDescriptor:")
+        guard displayClass.instancesRespond(to: initSel) else {
+            NSLog("[LidKeeper] initWithDescriptor: unavailable")
+            return false
+        }
+
+        let allocated = displayClass.perform(NSSelectorFromString("alloc"))?
+            .takeUnretainedValue() as! NSObject
+        guard let vd = allocated.perform(initSel, with: desc)?
+            .takeUnretainedValue() as? NSObject
+        else {
+            NSLog("[LidKeeper] CGVirtualDisplay init failed")
+            return false
+        }
+
+        // Apply settings
+        let mode = createMode(modeClass, width: 1920, height: 1080, refreshRate: 60.0)
+        if let mode {
+            let settings = settingsClass.perform(NSSelectorFromString("new"))?
+                .takeUnretainedValue() as! NSObject
+            settings.perform(NSSelectorFromString("setModes:"), with: [mode])
+            settings.setValue(2, forKey: "hiDPI")
+            vd.perform(NSSelectorFromString("applySettings:"), with: settings)
+        }
+
+        display = vd
+        NSLog("[LidKeeper] Virtual display created")
+
+        // Mirror to main after a short delay (needs display to settle)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let id = self?.displayID else { return }
+            var config: CGDisplayConfigRef?
+            guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return }
+            CGConfigureDisplayMirrorOfDisplay(cfg, id, CGMainDisplayID())
+            CGCompleteDisplayConfiguration(cfg, .forSession)
+        }
+
+        return true
+    }
+
+    func destroy() {
+        if let id = displayID {
+            var config: CGDisplayConfigRef?
+            if CGBeginDisplayConfiguration(&config) == .success, let cfg = config {
+                CGConfigureDisplayMirrorOfDisplay(cfg, id, kCGNullDirectDisplay)
+                CGCompleteDisplayConfiguration(cfg, .forSession)
+            }
+        }
+        display = nil
+        NSLog("[LidKeeper] Virtual display destroyed")
+    }
+
+    private func createMode(_ cls: NSObject.Type, width: Int, height: Int, refreshRate: Double) -> NSObject? {
+        let sel = NSSelectorFromString("initWithWidth:height:refreshRate:")
+        guard cls.instancesRespond(to: sel) else { return nil }
+        typealias InitFn = @convention(c) (AnyObject, Selector, Int, Int, Double) -> AnyObject?
+        let obj = cls.perform(NSSelectorFromString("alloc"))?.takeUnretainedValue() as! NSObject
+        let m = class_getInstanceMethod(cls, sel)!
+        return unsafeBitCast(method_getImplementation(m), to: InitFn.self)(obj, sel, width, height, refreshRate) as? NSObject
+    }
+}
 
 // MARK: - AppDelegate
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    // MARK: - Properties
-
     private var statusItem: NSStatusItem!
-    private var isEnabled = false
-    private var lidClosed = false
-    private var displaySleepTimer: Timer?
-    private var lidPollTimer: Timer?
-    private var caffeinateProcess: Process?
-
-    // IOPMAssertion handles (from C bridge)
-    private var preventSleepAssertion: UInt32 = 0
-    private var noIdleSleepAssertion: UInt32 = 0
-
-    // Menu item references (avoid NSMenu.item(withIdentifier:) which needs macOS 14+)
+    private var isEnabled = false {
+        didSet { refreshMenuBar() }
+    }
+    private let vdm = VirtualDisplayManager()
     private var statusMenuItem: NSMenuItem!
     private var toggleMenuItem: NSMenuItem!
 
-    // MARK: - NSApplicationDelegate
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        setupStatusItem()
+    func applicationDidFinishLaunching(_: Notification) {
+        setupMenuBar()
         enable()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
+    func applicationWillTerminate(_: Notification) {
         disable()
     }
 
-    // MARK: - Status Item & Menu
-
-    private func setupStatusItem() {
+    private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            button.image = drawIcon()
-        }
+        statusItem.button?.image = drawIcon()
 
         let menu = NSMenu()
-
         statusMenuItem = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
-
         menu.addItem(.separator())
-
-        toggleMenuItem = NSMenuItem(title: "Turn Off", action: #selector(toggleEnabled), keyEquivalent: "")
+        toggleMenuItem = NSMenuItem(title: "Turn On", action: #selector(toggleEnabled), keyEquivalent: "")
         menu.addItem(toggleMenuItem)
-
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit LidKeeper", action: #selector(quitApp), keyEquivalent: "q"))
-
         statusItem.menu = menu
     }
 
-    // MARK: - Icon Drawing
+    private func refreshMenuBar() {
+        statusItem.button?.image = drawIcon()
+        statusMenuItem.title = isEnabled ? "✅ Virtual Display Active" : "⛔ Disabled"
+        toggleMenuItem.title = isEnabled ? "Turn Off" : "Turn On"
+    }
 
     private func drawIcon() -> NSImage {
-        let image = NSImage(size: NSSize(width: 20, height: 20))
-        image.lockFocus()
-
-        // Use black outline for inactive (visible on both light/dark bars)
-        let fillColor: NSColor = isEnabled ? .systemGreen : .labelColor
-        let textColor: NSColor = isEnabled ? .white : .labelColor
-
-        // Rounded rectangle body
+        let img = NSImage(size: NSSize(width: 20, height: 20))
+        img.lockFocus()
+        let fill = isEnabled ? NSColor.systemGreen : NSColor.labelColor
         let rect = NSRect(x: 2, y: 3, width: 16, height: 13)
         let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
-        fillColor.setFill()
+        fill.setFill()
         path.fill()
-
         if !isEnabled {
-            // Outline for inactive so it's always visible
             NSColor.separatorColor.setStroke()
             path.lineWidth = 1
             path.stroke()
         }
-
-        // Lid line
         let lid = NSBezierPath()
         lid.move(to: NSPoint(x: 3, y: 9))
         lid.line(to: NSPoint(x: 17, y: 9))
-        lid.lineWidth = 2.0
+        lid.lineWidth = 2
         (isEnabled ? NSColor.white : NSColor.labelColor).setStroke()
         lid.stroke()
-
-        // Letter "L" to make it distinguishable
-        let letter = (isEnabled ? "Lz" : "L") as NSString
-        letter.draw(at: NSPoint(x: 7, y: 5), withAttributes: [
+        let label = (isEnabled ? "Ld" : "L") as NSString
+        label.draw(at: NSPoint(x: 7, y: 5), withAttributes: [
             .font: NSFont.systemFont(ofSize: 7, weight: .bold),
-            .foregroundColor: textColor
+            .foregroundColor: isEnabled ? NSColor.white : NSColor.labelColor
         ])
-
-        image.unlockFocus()
-        image.isTemplate = false
-        return image
+        img.unlockFocus()
+        img.isTemplate = false
+        return img
     }
 
-    // MARK: - Actions
-
     @objc private func toggleEnabled() {
-        if isEnabled { disable() } else { enable() }
+        isEnabled ? disable() : enable()
     }
 
     @objc private func quitApp() {
@@ -124,174 +212,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    // MARK: - Enable / Disable
-
     private func enable() {
+        guard vdm.create() else {
+            showAlert("Error", "Failed to create virtual display.\nThis app requires macOS 14+ with CGVirtualDisplay support.")
+            return
+        }
         isEnabled = true
-        updateUI()
-
-        // 1. Create IOPMAssertions (stronger than caffeinate)
-        preventSleepAssertion = "LidKeeper:preventSystemSleep".withCString { ptr in
-            pm_preventSystemSleep(ptr)
-        }
-        noIdleSleepAssertion = "LidKeeper:noIdleSleep".withCString { ptr in
-            pm_noIdleSleep(ptr)
-        }
-
-        if preventSleepAssertion == 0 && noIdleSleepAssertion == 0 {
-            // Fallback to caffeinate if assertions failed
-            startCaffeinate()
-        }
-
-        // 2. Prevent display timeout (we control it manually)
-        shell("pmset", "-a", "displaysleep", "0")
-
-        // 3. Read initial lid state
-        lidClosed = readClamshellState()
-        if lidClosed {
-            startDisplaySleepLoop()
-        }
-
-        // 4. Start polling
-        startLidPolling()
     }
 
     private func disable() {
+        vdm.destroy()
         isEnabled = false
-        lidClosed = false
-        updateUI()
-
-        stopDisplaySleepLoop()
-        stopLidPolling()
-        stopCaffeinate()
-        releaseAssertions()
-        shell("pmset", "-a", "displaysleep", "30")
     }
 
-    private func releaseAssertions() {
-        if preventSleepAssertion != 0 {
-            _ = pm_releaseAssertion(preventSleepAssertion)
-            preventSleepAssertion = 0
-        }
-        if noIdleSleepAssertion != 0 {
-            _ = pm_releaseAssertion(noIdleSleepAssertion)
-            noIdleSleepAssertion = 0
-        }
-    }
-
-    private func updateUI() {
-        statusItem.button?.image = drawIcon()
-
-        let statusText: String
-        if !isEnabled {
-            statusText = "⛔ Disabled"
-        } else if lidClosed {
-            statusText = "✅ Lid Closed — Display Off"
-        } else {
-            statusText = "✅ Lid Open — Running"
-        }
-        statusMenuItem.title = statusText
-        toggleMenuItem.title = isEnabled ? "Turn Off" : "Turn On"
-    }
-
-    // MARK: - Caffeinate (fallback)
-
-    private func startCaffeinate() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        p.arguments = ["-i", "-m", "-s", "-u"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        caffeinateProcess = p
-    }
-
-    private func stopCaffeinate() {
-        caffeinateProcess?.terminate()
-        caffeinateProcess = nil
-    }
-
-    // MARK: - Lid Polling via IOKit
-
-    private func startLidPolling() {
-        lidPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updateLidState()
-        }
-    }
-
-    private func stopLidPolling() {
-        lidPollTimer?.invalidate()
-        lidPollTimer = nil
-    }
-
-    private func updateLidState() {
-        let wasClosed = lidClosed
-        lidClosed = readClamshellState()
-        guard lidClosed != wasClosed else {
-            // Even if state hasn't changed, keep display off while lid is closed
-            if lidClosed {
-                shell("pmset", "displaysleepnow")
-            }
-            return
-        }
-
-        if lidClosed {
-            startDisplaySleepLoop()
-        } else {
-            stopDisplaySleepLoop()
-        }
-        updateUI()
-    }
-
-    /// Read AppleClamshellState from the IOKit registry.
-    private func readClamshellState() -> Bool {
-        let matching = IOServiceMatching("AppleClamshellState")
-        var iterator: io_iterator_t = 0
-        let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
-        guard kr == KERN_SUCCESS else { return false }
-        defer { IOObjectRelease(iterator) }
-
-        let service = IOIteratorNext(iterator)
-        guard service != 0 else { return false }
-        defer { IOObjectRelease(service) }
-
-        let prop = IORegistryEntryCreateCFProperty(
-            service,
-            "ClamshellState" as CFString,
-            kCFAllocatorDefault,
-            0
-        )
-        guard let p = prop else { return false }
-        return (p.takeRetainedValue() as? Bool) ?? false
-    }
-
-    // MARK: - Display Sleep Loop
-
-    private func startDisplaySleepLoop() {
-        stopDisplaySleepLoop()
-        shell("pmset", "displaysleepnow")
-        displaySleepTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.shell("pmset", "displaysleepnow")
-        }
-    }
-
-    private func stopDisplaySleepLoop() {
-        displaySleepTimer?.invalidate()
-        displaySleepTimer = nil
-    }
-
-    // MARK: - Shell Helper
-
-    @discardableResult
-    private func shell(_ args: String...) -> Int32 {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        task.arguments = args
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
-        return task.terminationStatus
+    private func showAlert(_ title: String, _ message: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = message
+        a.runModal()
     }
 }
 
