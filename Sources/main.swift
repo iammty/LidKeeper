@@ -73,33 +73,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Icon Drawing
 
     private func drawIcon() -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18))
+        let image = NSImage(size: NSSize(width: 20, height: 20))
         image.lockFocus()
 
-        let color: NSColor = isEnabled ? .systemGreen : .systemGray
+        // Use black outline for inactive (visible on both light/dark bars)
+        let fillColor: NSColor = isEnabled ? .systemGreen : .labelColor
+        let textColor: NSColor = isEnabled ? .white : .labelColor
 
-        // Body
-        let rect = NSRect(x: 2, y: 3, width: 14, height: 11)
+        // Rounded rectangle body
+        let rect = NSRect(x: 2, y: 3, width: 16, height: 13)
         let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
-        color.setFill()
+        fillColor.setFill()
         path.fill()
+
+        if !isEnabled {
+            // Outline for inactive so it's always visible
+            NSColor.separatorColor.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
 
         // Lid line
         let lid = NSBezierPath()
         lid.move(to: NSPoint(x: 3, y: 9))
-        lid.line(to: NSPoint(x: 15, y: 9))
-        lid.lineWidth = 2.5
-        NSColor.white.setStroke()
+        lid.line(to: NSPoint(x: 17, y: 9))
+        lid.lineWidth = 2.0
+        (isEnabled ? NSColor.white : NSColor.labelColor).setStroke()
         lid.stroke()
 
-        // "zZ" when active
-        if isEnabled {
-            let zz = "zZ" as NSString
-            zz.draw(at: NSPoint(x: 7, y: 5), withAttributes: [
-                .font: NSFont.systemFont(ofSize: 5, weight: .bold),
-                .foregroundColor: NSColor.white
-            ])
-        }
+        // Letter "L" to make it distinguishable
+        let letter = (isEnabled ? "Lz" : "L") as NSString
+        letter.draw(at: NSPoint(x: 7, y: 5), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 7, weight: .bold),
+            .foregroundColor: textColor
+        ])
 
         image.unlockFocus()
         image.isTemplate = false
