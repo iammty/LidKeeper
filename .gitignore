@@ -1,5 +1,10 @@
 # Build outputs
+LidKeeper
 *.o
 *.d
-# We don't track the .app bundle
+
+# macOS
 .DS_Store
+
+# Xcode user data
+*.xcuserdata/
