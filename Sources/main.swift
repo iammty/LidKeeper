@@ -1,6 +1,13 @@
 import Cocoa
 import CoreGraphics
 
+// MARK: - C bridge: Power Management assertions
+@_silgen_name("pm_no_idle_sleep")
+func pm_no_idle_sleep(_ reason: UnsafePointer<CChar>) -> UInt32
+
+@_silgen_name("pm_release_assertion")
+func pm_release_assertion(_ id: UInt32) -> Int32
+
 // MARK: - Virtual Display Manager via ObjC Runtime
 // CGVirtualDisplay, CGVirtualDisplayDescriptor, CGVirtualDisplaySettings
 // are private CoreGraphics classes. Access them via ObjC runtime instead of
@@ -140,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         didSet { refreshMenuBar() }
     }
     private let vdm = VirtualDisplayManager()
+    private var pmAssertionID: UInt32 = 0
     private var statusMenuItem: NSMenuItem!
     private var toggleMenuItem: NSMenuItem!
 
@@ -192,10 +200,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showAlert("Error", "Failed to create virtual display.\nThis app requires macOS 14+ with CGVirtualDisplay support.")
             return
         }
+        // Keep WiFi/network subsystems awake when lid closes
+        pmAssertionID = "LidKeeper active".withCString { pm_no_idle_sleep($0) }
+        if pmAssertionID != 0 {
+            NSLog("[LidKeeper] NoIdleSleep assertion created: \(pmAssertionID)")
+        } else {
+            NSLog("[LidKeeper] WARNING: NoIdleSleep assertion failed")
+        }
         isEnabled = true
     }
 
     private func disable() {
+        if pmAssertionID != 0 {
+            let ret = pm_release_assertion(pmAssertionID)
+            NSLog("[LidKeeper] NoIdleSleep assertion released: \(ret == 0 ? "OK" : "FAIL")")
+            pmAssertionID = 0
+        }
         vdm.destroy()
         isEnabled = false
     }

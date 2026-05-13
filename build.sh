@@ -2,9 +2,9 @@
 set -euo pipefail
 
 APP_NAME="LidKeeper"
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/Sources/main.swift"
+SRC_SWIFT="$SCRIPT_DIR/Sources/main.swift"
+SRC_C="$SCRIPT_DIR/Sources/pm_helper.c"
 INFO="$SCRIPT_DIR/Resources/Info.plist"
 APP_DIR="/Applications/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
@@ -16,19 +16,17 @@ swiftc \
     -module-name LidKeeper \
     -framework Cocoa \
     -framework CoreGraphics \
-    "$SRC"
+    -framework IOKit \
+    "$SRC_SWIFT" \
+    "$SRC_C"
 
 echo "==> Creating .app bundle at $APP_DIR..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS"
-
 cp "$SCRIPT_DIR/$APP_NAME" "$MACOS/"
 cp "$INFO" "$CONTENTS/"
-
 codesign --force --sign - "$MACOS/$APP_NAME" 2>/dev/null || true
-
 rm "$SCRIPT_DIR/$APP_NAME"
-
 echo "==> Done! Installed to $APP_DIR"
 echo ""
 echo "  Launch:  open $APP_DIR"
